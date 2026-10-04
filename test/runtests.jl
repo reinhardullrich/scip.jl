@@ -25,6 +25,8 @@ include("sepa_support.jl")
         "cutsel.jl",
         "direct_library_calls.jl",
         "eventhdlr.jl",
+        "library.jl",
+        "exact_optimizer.jl",
         "MOI_tests.jl",
         "scip_data.jl",
     ]

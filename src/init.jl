@@ -19,7 +19,10 @@ else
     end
 end
 
+include("library.jl")
+
 function __init__()
+    _load_library()
     config = LinearAlgebra.BLAS.lbt_get_config()
     if !any(lib -> lib.interface == :lp64, config.loaded_libs)
         LinearAlgebra.BLAS.lbt_forward(OpenBLAS32_jll.libopenblas_path)

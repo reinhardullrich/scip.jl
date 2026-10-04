@@ -20,7 +20,7 @@ Used to convert Julia expression to SCIP expression using recursive calls to the
 mutating push_expr!.
 """
 mutable struct NonlinExpr
-    exprs::Vector{Ref{Ptr{SCIP_EXPR}}}
+    exprs::Vector{Base.RefValue{Ptr{SCIP_EXPR}}}
 end
 
 NonlinExpr() = NonlinExpr([])
@@ -61,12 +61,25 @@ mutable struct SCIPData
     # to store expressions for release
     nonlinear_storage::Vector{NonlinExpr}
 
-    function SCIPData()
+    function SCIPData(; exact::Bool = false)
         scip = Ref{Ptr{SCIP_}}(C_NULL)
         @SCIP_CALL SCIPcreate(scip)
         @assert scip[] != C_NULL
-        @SCIP_CALL SCIPincludeDefaultPlugins(scip[])
-        @SCIP_CALL SCIPcreateProbBasic(scip[], "")
+        try
+            if exact
+                SCIPmajorVersion() >= 10 || error("ExactOptimizer requires SCIP 10 or newer")
+                @SCIP_CALL SCIPenableExactSolving(scip[], TRUE)
+            end
+            @SCIP_CALL SCIPincludeDefaultPlugins(scip[])
+            @SCIP_CALL SCIPcreateProbBasic(scip[], "")
+            if exact && (SCIPisExact(scip[]) == FALSE ||
+                         SCIPfindConshdlr(scip[], "exactlinear") == C_NULL)
+                error("This SCIP library does not provide exact linear solving")
+            end
+        catch
+            SCIPfree(scip)
+            rethrow()
+        end
         scip_data = new(
             scip,
             Dict{VarRef,Base.RefValue{Ptr{SCIP_VAR}}}(),
@@ -90,6 +103,14 @@ end
 # Protect SCIPData from GC for ccall with Ptr{SCIP_} argument.
 Base.unsafe_convert(::Type{Ptr{SCIP_}}, scipd::SCIPData) = scipd.scip[]
 
+function _release_expressions!(scipd::SCIPData, nonlin::NonlinExpr)
+    for expr in nonlin.exprs
+        @SCIP_CALL SCIPreleaseExpr(scipd.scip[], expr)
+    end
+    empty!(nonlin.exprs)
+    return nothing
+end
+
 function free_scip(scipd::SCIPData)
     # Avoid double-free (SCIP will set the pointers to NULL).
     if scipd.scip[] != C_NULL
@@ -97,9 +118,7 @@ function free_scip(scipd::SCIPData)
             @SCIP_CALL SCIPreleaseCons(scipd, c)
         end
         for nonlin in scipd.nonlinear_storage
-            for expr in nonlin.exprs
-                @SCIP_CALL SCIPreleaseExpr(scipd.scip[], expr)
-            end
+            _release_expressions!(scipd, nonlin)
         end
         for v in values(scipd.vars)
             @SCIP_CALL SCIPreleaseVar(scipd, v)

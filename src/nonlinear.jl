@@ -24,16 +24,107 @@ const UNARY_OPS_LOOKUP = (
     sin=SCIPcreateExprSin,
 )
 
+# The accepted literal types are explicit in the compiled expression language.
+Base.@nospecializeinfer function _constant_number(@nospecialize(x))::Float64
+    if x isa Union{Float16,Float32,Float64}
+        return Float64(x)
+    elseif x isa Union{Bool,Int8,UInt8}
+        return Float64(x)
+    elseif x isa Union{Int16,UInt16,Int32}
+        return Float64(x)
+    elseif x isa Union{UInt32,Int64,UInt64}
+        return Float64(x)
+    elseif x isa Union{Int128,UInt128,BigInt}
+        return Float64(x)
+    elseif x isa Union{BigFloat,Rational{Int},Rational{BigInt}}
+        return Float64(x)
+    end
+    throw(ArgumentError("Unsupported literal in nonlinear expression"))
+end
+
+Base.@nospecializeinfer function _constant_expression(@nospecialize(x))::Float64
+    x isa Expr || return _constant_number(x)
+    Meta.isexpr(x, :call) || error("Unsupported constant expression")
+    op = x.args[1]::Symbol
+    args = Float64[_constant_expression(a) for a in x.args[2:end]]
+    n = length(args)
+    if op === :+
+        n >= 1 || error("Addition needs an operand")
+        return sum(args)
+    elseif op === :-
+        n >= 1 || error("Subtraction needs an operand")
+        return n == 1 ? -args[1] : args[1] - sum(args[2:end])
+    elseif op === :*
+        n >= 1 || error("Multiplication needs an operand")
+        return prod(args)
+    elseif op === :/ || op === :^
+        n == 2 || error("Division and power need two operands")
+        return op === :/ ? args[1] / args[2] : args[1]^args[2]
+    end
+    n == 1 || error("Unary operator needs one operand")
+    a = args[1]
+    if op === :sqrt
+        return sqrt(a)
+    elseif op === :exp
+        return exp(a)
+    elseif op === :log
+        return log(a)
+    elseif op === :abs
+        return abs(a)
+    elseif op === :sin
+        return sin(a)
+    elseif op === :cos
+        return cos(a)
+    end
+    error("Unsupported constant operator; precompute the constant before constructing the expression")
+end
+
+Base.@nospecializeinfer function push_expr!(nonlin::NonlinExpr, scip::Ptr{SCIP_}, vars, @nospecialize(expr))
+    if expr isa Expr
+        return _push_expression!(nonlin, scip, vars, expr)
+    end
+    return _push_literal!(nonlin, scip, vars, _constant_number(expr))
+end
+
+function _child_pointers!(nonlin::NonlinExpr, scip::Ptr{SCIP_}, vars, args, pairs)
+    children = Ptr{SCIP_EXPR}[]
+    for i in eachindex(pairs)
+        child, pure = pairs[i]
+        if pure && child[] == C_NULL
+            child, _ = _push_literal!(nonlin, scip, vars, _constant_expression(args[i+1]))
+        end
+        push!(children, child[])
+    end
+    return children
+end
+
+function _create_unary!(op::Symbol, scip, expr__, child)
+    if op === :exp
+        @SCIP_CALL SCIPcreateExprExp(scip, expr__, child, C_NULL, C_NULL)
+    elseif op === :log
+        @SCIP_CALL SCIPcreateExprLog(scip, expr__, child, C_NULL, C_NULL)
+    elseif op === :abs
+        @SCIP_CALL SCIPcreateExprAbs(scip, expr__, child, C_NULL, C_NULL)
+    elseif op === :sin
+        @SCIP_CALL SCIPcreateExprSin(scip, expr__, child, C_NULL, C_NULL)
+    elseif op === :cos
+        @SCIP_CALL SCIPcreateExprCos(scip, expr__, child, C_NULL, C_NULL)
+    else
+        error("Unsupported unary operator")
+    end
+    return nothing
+end
+
 """
 Extract operators from Julia expr recursively and convert to SCIP expressions.
 Returns the SCIP expression pointer, whether the expression is a pure value (without variables).
 """
-function push_expr!(
+function _push_expression!(
     nonlin::NonlinExpr,
     scip::Ptr{SCIP_},
     vars::Dict{VarRef,<:Ref{Ptr{SCIP_VAR}}},
     expr::Expr,
-)
+)::Tuple{Base.RefValue{Ptr{SCIP_EXPR}},Bool}
     # Storage for SCIP_EXPR*
     expr__ = Ref{Ptr{SCIP_EXPR}}(C_NULL)
     num_children = length(expr.args) - 1
@@ -42,13 +133,13 @@ function push_expr!(
     if Meta.isexpr(expr, :comparison) # range constraint
         # args: [lhs, <=, mid, <=, rhs], lhs and rhs constant
         @assert length(expr.args) == 5
-        @assert expr.args[2][1] == expr.args[4][1] == :<=
+        @assert expr.args[2] === :<= && expr.args[4] === :<=
 
         # just call on middle expression, bounds are handled outside
         return push_expr!(nonlin, scip, vars, expr.args[3])
 
     elseif Meta.isexpr(expr, :call) # operator
-        op = expr.args[1]
+        op = expr.args[1]::Symbol
         if op in (:(==), :<=, :>=)
             # args: [op, lhs, rhs], rhs constant
             @assert length(expr.args) == 3
@@ -70,7 +161,7 @@ function push_expr!(
             # Exponent (second child) is stored as value.
             @assert isa(expr.args[3], Number)
             if !pure_value
-                exponent = Cdouble(expr.args[3])
+                exponent = _constant_number(expr.args[3])
                 @SCIP_CALL SCIPcreateExprPow(
                     scip,
                     expr__,
@@ -114,17 +205,7 @@ function push_expr!(
                     pure_value = true
                 else
                     # replace pure-value expression by its evaluated value, since no expression has been evaluated yet
-                    subexprs = map(eachindex(subexprs_pairs)) do idx
-                        (subexpr, is_pure_value) = subexprs_pairs[idx]
-                        if is_pure_value
-                            expr_val = Meta.eval(expr.args[idx+1])
-                            expr_ptr, _ =
-                                push_expr!(nonlin, scip, vars, expr_val)
-                            expr_ptr[]
-                        else
-                            subexpr[]
-                        end
-                    end
+                    subexprs = _child_pointers!(nonlin, scip, vars, expr.args, subexprs_pairs)
                     coefs = fill(coef_mul, num_children)
                     coefs[1] = 1.0
                     @SCIP_CALL SCIPcreateExprSum(
@@ -149,17 +230,7 @@ function push_expr!(
             if all(pair -> pair[2], subexprs_pairs)
                 pure_value = true
             else
-                subexprs = map(eachindex(subexprs_pairs)) do idx
-                    (subexpr, is_pure_value) = subexprs_pairs[idx]
-                    if is_pure_value
-                        expr_val = Meta.eval(expr.args[idx+1])
-                        expr_ptr, _ =
-                            push_expr!(nonlin, scip, vars, expr_val)
-                        expr_ptr[]
-                    else
-                        subexpr[]
-                    end
-                end
+                subexprs = _child_pointers!(nonlin, scip, vars, expr.args, subexprs_pairs)
                 @SCIP_CALL SCIPcreateExprProduct(
                     scip,
                     expr__,
@@ -177,13 +248,7 @@ function push_expr!(
             # Insert child expression:
             child, pure_value = push_expr!(nonlin, scip, vars, expr.args[2])
             if !pure_value
-                @SCIP_CALL UNARY_OPS_LOOKUP[op](
-                    scip,
-                    expr__,
-                    child[],
-                    C_NULL,
-                    C_NULL,
-                )
+                _create_unary!(op, scip, expr__, child[])
             end
         elseif op == :sqrt
             child, pure_value = push_expr!(nonlin, scip, vars, expr.args[2])
@@ -209,11 +274,11 @@ function push_expr!(
                 pure_value = true
             else
                 if pure_left && expr.args[2] isa Expr
-                    val = Meta.eval(expr.args[2])
+                    val = _constant_expression(expr.args[2])
                     left, _ = push_expr!(nonlin, scip, vars, val)
                 end
                 if pure_right
-                    val = Meta.eval(inverse_right_expr)
+                    val = _constant_expression(inverse_right_expr)
                     right, _ = push_expr!(nonlin, scip, vars, val)
                 end
                 # TODO evaluate left or right
@@ -228,14 +293,7 @@ function push_expr!(
                 )
             end
         else
-            # attempt computation of pure value
-            try
-                Meta.eval(expr)
-            catch e
-                error("Operator $op (in $expr) not supported by SCIP.jl!")
-            end
-            # if reaching this point, the expression is a pure value
-            pure_value = true
+            error("Operator not supported by SCIP.jl; precompute unsupported constant expressions")
         end
 
     elseif Meta.isexpr(expr, :ref) # variable
@@ -243,13 +301,13 @@ function push_expr!(
         # :(x[MathOptInterface.VariableIndex(1)])
         @assert expr.args[1] == :x
         @assert num_children == 1
-        vi = expr.args[2] # MOI.VariableIndex
+        vi = expr.args[2]::MOI.VariableIndex
         vr = VarRef(vi.value)
         v = vars[vr][]
         @SCIP_CALL SCIPcreateExprVar(scip, expr__, v, C_NULL, C_NULL)
         pure_value = false
     else
-        error("Expression $expr not supported by SCIP.jl!")
+        error("Expression not supported by SCIP.jl")
     end
 
     if !pure_value
@@ -259,11 +317,11 @@ function push_expr!(
     return expr__, pure_value
 end
 
-function push_expr!(
+function _push_literal!(
     nonlin::NonlinExpr,
     scip::Ptr{SCIP_},
     vars::Dict{VarRef,<:Ref{Ptr{SCIP_VAR}}},
-    expr::Number,
+    expr::Float64,
 )
     # Storage for SCIP_EXPR*
     expr__ = Ref{Ptr{SCIP_EXPR}}(C_NULL)
@@ -297,10 +355,13 @@ function add_nonlinear_constraint(
     nonlin = NonlinExpr()
 
     # convert expression recursively, extract root and variable pointers
-    root_expr, pure_value = push_expr!(nonlin, scipd.scip[], scipd.vars, expr)
-    if pure_value
-        # TODO
-        error("Constraint $expr with pure value")
+    root_expr, pure_value = try
+        result = push_expr!(nonlin, scipd.scip[], scipd.vars, expr)
+        result[2] && error("A nonlinear constraint must contain a variable")
+        result
+    catch
+        _release_expressions!(scipd, nonlin)
+        rethrow()
     end
     # create and add cons_nonlinear
     cons__ = Ref{Ptr{SCIP_CONS}}(C_NULL)

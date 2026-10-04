@@ -76,6 +76,45 @@ set_attribute(model, "limits/gap", 0.05)
 
 ## Options
 
+### Experimental exact linear/MILP support in this fork
+
+The arithmetic type can be chosen at construction. `Optimizer()` and
+`Optimizer(Float64)` retain the existing numerical adapter. With a SCIP 10
+library built with exact-solving support:
+
+```julia
+using JuMP, SCIP
+const Q = Rational{BigInt}
+model = GenericModel{Q}(() -> SCIP.Optimizer(Q); add_bridges = false)
+set_silent(model)
+@variable(model, x >= 1//3)
+@objective(model, Min, 2//7 * x + 2//5)
+optimize!(model)
+@assert value(x) == big(1)//3
+@assert objective_value(model) == big(52)//105
+```
+
+`Optimizer(Q)` constructs the concrete `ExactOptimizer` adapter. It supports
+rational affine objectives and constraints, variable bounds, and integer/binary
+domains. It builds a fresh native problem on each solve, using SCIP's exact
+variable data and exact linear constraints. Every returned primal point is
+checked against the original rational constraints, domains and objective; an
+optimal result also requires equal exact primal and dual bounds. Numerators
+and denominators are transferred losslessly through SCIP's rational API.
+SCIP itself uses both approximate and exact calculations internally.
+
+Use the normal cached JuMP model. Direct/incremental mode, quadratic/nonlinear
+constraints, callbacks, starts, dual multipliers and infeasibility/unboundedness
+certificates are not implemented by this adapter. Unsupported input is rejected;
+there is no numerical fallback. Model edits in the JuMP cache take effect on the
+next solve. Exact-mode options and nonzero optimality gaps cannot be enabled
+through the adapter. Finite results use `Rational{BigInt}`; an unbounded objective
+bound uses an infinity sentinel.
+
+Custom libraries use the existing `SCIPOPTDIR` / `Pkg.build("SCIP")` workflow
+above. Selecting the native library is independent of the arithmetic choice.
+This extension is experimental and has not been accepted upstream.
+
 See the [SCIP documentation](https://www.scipopt.org/doc/html/PARAMETERS.php)
 for a list of supported options.
 
@@ -123,6 +162,33 @@ List of supported model attributes:
  * [`MOI.UserCutCallback()`](@ref)
 
 ## Design considerations
+
+### Optional native-library isolation (experimental fork)
+
+On Linux/glibc, set `SCIPJL_ISOLATE=1` and `SCIPOPTDIR` to a native SCIP
+installation, then run `Pkg.build("SCIP")`. Keep `SCIPJL_ISOLATE=1` set before
+starting Julia to use isolation. The default outside this project's launcher is
+the upstream shared loading mode (`SCIPJL_ISOLATE=0`). Unsupported platforms,
+missing builds, or mismatched native libraries fail explicitly.
+
+Both `SCIP.Optimizer(Float64)` and `SCIP.Optimizer(Rational{BigInt})` use the
+selected handle. A private glibc namespace keeps SCIP's GMP allocator separate
+from Julia's GC-counted allocator. The SCIP binary and optimization settings
+are unchanged. The generated API is bound once per process; no native pointers
+are saved in precompile caches. JuMP models and other solver connectors need
+no changes. Build requires a C compiler (`CC`, default `cc`).
+
+The tiny native companion makes `dlopen` requests local within the private
+namespace. This accommodates TBB's allocator loader: glibc does not support its
+`RTLD_GLOBAL` requests in a new namespace. Libraries that require process-global
+plugin exports are not supported in isolation mode. The companion is never
+preloaded into Julia's main namespace and never changes GMP allocation hooks.
+
+Low-level callers must use the generated SCIP API for objects from this
+connector. Do not mix pointers with a second `ccall((symbol, SCIP.libscip), ...)`
+instance. Native GMP objects, `FILE*` streams and allocated memory must stay
+with their owning native library; transfer values through the API instead.
+The namespace stays loaded until process exit so finalizers remain valid.
 
 ### Wrapping the public API
 

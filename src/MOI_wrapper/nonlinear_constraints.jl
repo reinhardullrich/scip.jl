@@ -45,7 +45,12 @@ function MOI.add_constraint(
 )
     allow_modification(model)
     expr = NonlinExpr()
-    root = _SCIPcreateExpr(model, f, expr)
+    root = try
+        _SCIPcreateExpr(model, f, expr)
+    catch
+        _release_expressions!(model.inner, expr)
+        rethrow()
+    end
     l, u = bounds(model, s)
     cons__ = Ref{Ptr{SCIP_CONS}}(C_NULL)
     @SCIP_CALL SCIPcreateConsBasicNonlinear(model, cons__, "", root[], l, u)
@@ -58,14 +63,38 @@ function MOI.add_constraint(
     return ci
 end
 
-function _SCIPcreateExpr(model::Optimizer, f::Real, expr::NonlinExpr)
+# Expression arguments are boxed by MOI. Dispatch explicitly once at the boundary
+# so fixed-code compilation does not need an open-ended method lookup.
+Base.@nospecializeinfer function _SCIPcreateExpr(model::Optimizer, @nospecialize(f), expr::NonlinExpr)
+    if f isa MOI.ScalarNonlinearFunction
+        return _SCIPcreateExpr_typed(model, f, expr)
+    elseif f isa MOI.VariableIndex
+        return _SCIPcreateExpr_typed(model, f, expr)
+    elseif f isa MOI.ScalarAffineFunction{Float64}
+        return _SCIPcreateExpr_typed(model, f, expr)
+    elseif f isa MOI.ScalarQuadraticFunction{Float64}
+        return _SCIPcreateExpr_typed(model, f, expr)
+    end
+    return _SCIPcreateExpr_typed(model, _constant_number(f), expr)
+end
+
+function _SCIPchildren(model::Optimizer, args::Vector{Any}, expr::NonlinExpr)
+    children = Ptr{SCIP_EXPR}[]
+    sizehint!(children, length(args))
+    for arg in args
+        push!(children, _SCIPcreateExpr(model, arg, expr)[])
+    end
+    return children
+end
+
+function _SCIPcreateExpr_typed(model::Optimizer, f::Real, expr::NonlinExpr)
     ret = Ref{Ptr{SCIP_EXPR}}(C_NULL)
     @SCIP_CALL SCIPcreateExprValue(model, ret, f, C_NULL, C_NULL)
     push!(expr.exprs, ret)
     return ret
 end
 
-function _SCIPcreateExpr(
+function _SCIPcreateExpr_typed(
     model::Optimizer,
     f::MOI.VariableIndex,
     expr::NonlinExpr,
@@ -77,14 +106,14 @@ function _SCIPcreateExpr(
     return ret
 end
 
-function _SCIPcreateExpr(
+function _SCIPcreateExpr_typed(
     model::Optimizer,
     f::MOI.ScalarNonlinearFunction,
     expr::NonlinExpr,
 )
     ret = Ref{Ptr{SCIP_EXPR}}(C_NULL)
     if f.head == :+
-        children = map(arg -> _SCIPcreateExpr(model, arg, expr)[], f.args)
+        children = _SCIPchildren(model, f.args, expr)
         @SCIP_CALL SCIPcreateExprSum(
             model,
             ret,
@@ -96,7 +125,7 @@ function _SCIPcreateExpr(
             C_NULL,
         )
     elseif f.head == :*
-        x = map(arg -> _SCIPcreateExpr(model, arg, expr)[], f.args)
+        x = _SCIPchildren(model, f.args, expr)
         n = length(f.args)
         @SCIP_CALL SCIPcreateExprProduct(model, ret, n, x, 1.0, C_NULL, C_NULL)
     elseif f.head == :/
@@ -111,7 +140,7 @@ function _SCIPcreateExpr(
         @SCIP_CALL SCIPcreateExprProduct(model, ret, 2, xy, 1.0, C_NULL, C_NULL)
     elseif f.head == :-
         @assert 1 <= length(f.args) <= 2
-        children = map(arg -> _SCIPcreateExpr(model, arg, expr)[], f.args)
+        children = _SCIPchildren(model, f.args, expr)
         n = length(f.args)
         coefficients = ones(Float64, n)
         coefficients[end] = -1.0
@@ -131,7 +160,7 @@ function _SCIPcreateExpr(
             throw(MOI.UnsupportedNonlinearOperator(f.head))
         end
         child = _SCIPcreateExpr(model, first(f.args), expr)
-        expon = convert(Float64, f.args[2])
+        expon = _constant_number(f.args[2])
         @SCIP_CALL SCIPcreateExprPow(model, ret, child[], expon, C_NULL, C_NULL)
     elseif f.head == :abs
         child = _SCIPcreateExpr(model, only(f.args), expr)
@@ -158,7 +187,7 @@ function _SCIPcreateExpr(
     return ret
 end
 
-function _SCIPcreateExpr(
+function _SCIPcreateExpr_typed(
     model::Optimizer,
     f::MOI.ScalarAffineFunction,
     expr::NonlinExpr,
@@ -185,7 +214,7 @@ function _SCIPcreateExpr(
     return ret
 end
 
-function _SCIPcreateExpr(
+function _SCIPcreateExpr_typed(
     model::Optimizer,
     f::MOI.ScalarQuadraticFunction,
     expr::NonlinExpr,

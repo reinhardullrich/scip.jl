@@ -37,6 +37,7 @@ include("nonlinear.jl")
 
 # implementation of MOI
 include("MOI_wrapper.jl")
+include("exact_optimizer.jl")
 
 # convenience functions
 include("convenience.jl")

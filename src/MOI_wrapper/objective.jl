@@ -87,7 +87,7 @@ function MOI.set(
         MOI.set(
             o,
             MOI.ObjectiveFunction{MOI.ScalarAffineFunction{Float64}}(),
-            MOI.ScalarAffineFunction{Float64}([], 0.0),
+            MOI.ScalarAffineFunction(MOI.ScalarAffineTerm{Float64}[], 0.0),
         )
     end
     o.objective_sense = sense

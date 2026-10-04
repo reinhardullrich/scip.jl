@@ -16,6 +16,15 @@ if isfile(depsfile)
 end
 
 function write_depsfile(path)
+    if get(ENV, "SCIPJL_ISOLATE", "0") == "1"
+        Sys.islinux() || error("SCIPJL_ISOLATE requires Linux with glibc")
+        path = realpath(path)
+        source = joinpath(@__DIR__, "namespace.c")
+        output = joinpath(@__DIR__, "libscipjl_namespace.so")
+        compiler = get(ENV, "CC", "cc")
+        # One small C loader; SCIP itself is not rebuilt or modified.
+        run(`$compiler -O2 -shared -fPIC $source -Wl,--no-as-needed $path -Wl,-rpath,$(dirname(path)) -ldl -o $output`)
+    end
     open(depsfile, "w") do f
         print(f, "const libscip = ")
         show(f, path)
@@ -48,13 +57,16 @@ found = false
 tried = String[]
 for l in paths_to_try
     try
-        d = Libdl.dlopen(l)
-        global found = true
-        write_depsfile(l)
-        break
+        Libdl.dlopen(l) do handle
+            nothing
+        end
     catch e
-        push!(tried, "$(l): $(e.msg)")
+        push!(tried, "$(l): $(sprint(showerror, e))")
+        continue
     end
+    write_depsfile(l)
+    global found = true
+    break
 end
 
 if !found && !haskey(ENV, "SCIP_JL_SKIP_LIB_CHECK")

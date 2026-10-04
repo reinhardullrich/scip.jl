@@ -131,6 +131,8 @@ function test_nonlinear_pot_pourri()
     for i in 1:num_vars
         MOI.add_constraint(optimizer, x[i], MOI.Interval(0.1, 10.0))
     end
+    # Unsupported constant operations are computed before building the graph.
+    constant_term = tan(0.25)
     # Nonlinear equations.
     rhs = 2.0
     expressions = Expr[
@@ -148,7 +150,7 @@ function test_nonlinear_pot_pourri()
         :(abs(x[$(x[18])] - 11) == rhs), # ABS
         :(cos(x[$(x[19])]) + 1 == rhs), # COS
         :(sin(x[$(x[20])]) + 2 == rhs), # SIN
-        :(x[$(x[21])] + tan(rand()) / (1 + 1.2^4.2) - 2 * 1 / 4 == rhs), # additional terms
+        :(x[$(x[21])] + $constant_term / (1 + 1.2^4.2) - 2 * 1 / 4 == rhs), # additional terms
     ]
     data = MOI.NLPBlockData(
         [MOI.NLPBoundsPair(rhs, rhs) for i in 1:length(expressions)],

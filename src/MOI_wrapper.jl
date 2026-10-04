@@ -32,7 +32,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     constypes::Dict{Tuple{Type,Type},Set{ConsRef}}
     binbounds::Dict{MOI.VariableIndex,MOI.Interval{Float64}} # only for binary variables
     bound_types::Dict{MOI.VariableIndex,_SCIP_BOUND_TYPE}
-    params::Dict{String,Any}
+    params::Dict{String,Union{Bool,Cint,Clonglong,Cdouble,Char,String}}
     start::Dict{MOI.VariableIndex,Float64} # can be partial
     moi_separator::Any # ::Union{CutCbSeparator, Nothing}
     moi_heuristic::Any # ::Union{HeuristicCb, Nothing}
@@ -56,7 +56,7 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
             Dict{Tuple{Type,Type},Set{ConsRef}}(),
             Dict{MOI.VariableIndex,MOI.Interval{Float64}}(),
             Dict{MOI.VariableIndex,_SCIP_BOUND_TYPE}(),
-            Dict{String,Any}(),
+            Dict{String,Union{Bool,Cint,Clonglong,Cdouble,Char,String}}(),
             Dict{MOI.VariableIndex,Float64}(),
             nothing,
             nothing,
@@ -226,7 +226,7 @@ end
 
 function MOI.set(o::Optimizer, param::MOI.RawOptimizerAttribute, value)
     set_parameter(o.inner, param.name, value)
-    o.params[param.name] = value
+    o.params[param.name] = get_parameter(o.inner, param.name)
     return nothing
 end
 
